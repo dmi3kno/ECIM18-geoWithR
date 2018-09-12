@@ -1,0 +1,559 @@
+---
+title: "OsloBnB"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    source_code: embed
+    theme: simplex
+    #css: style.css
+    logo: img/equinor_logo_white_208x48.png
+    favicon: img/datagym_icon_round_icon.ico
+---
+
+```{r parameters, echo=FALSE,include=FALSE,message=FALSE}
+library(here)
+library(tidyverse)
+library(polite)
+library(rvest)
+library(mapview)
+library(sf)
+library(raster)
+library(fasterize)
+library(RPostgreSQL)
+library(rpostgis)
+library(mapsapi)
+library(patchwork)
+library(ggmap)
+library(ggrepel)
+library(plotly)
+library(lubridate)
+library(hrbrthemes)
+library(extrafont)
+library(crosstalk)
+library(leaflet)
+library(d3scatter) #devtools::install_github("jcheng5/d3scatter")
+library(summarywidget)
+library(htmltools)
+knitr::opts_chunk$set(echo=FALSE, fig.width=10, fig.height=6, results='asis',
+                      comment=NA, warning=FALSE, message=FALSE)
+```
+
+Introduction
+==========
+<br></br>
+<br></br>
+<br></br>
+<br></br>
+<br></br>
+<br></br>
+
+<h1>**OsloBnB**</h1>
+
+<h2>_Where to stay in Oslo?_</h2>
+
+<br></br>
+<br></br>
+<img style="float: right;" src="img/ecim.png">
+
+
+Data
+==============
+```{r core_data}
+places_df <- tibble::tribble(
+  ~place, ~lat, ~lon, ~url, 
+  "Work", 59.895720, 10.629540, "https://media-cdn.tripadvisor.com/media/photo-s/0b/ee/27/9e/p-20160711-045718-hdr.jpg",
+  "UiO", 59.940130, 10.720290,  "https://www.uio.no/english/studies/why-choose-uio/bilder/gsh-970.jpg",
+  "BI", 59.948872, 10.768210, "https://nielstorp.no/wp-content/uploads/2015/01/BI.Nydalen.21-480x270.jpg",
+  "Meetup", 59.923450, 10.731790, "https://img.gfx.no/1845/1845622/DSC05635.jpg")
+
+places_sf <- places_df %>% 
+    st_as_sf(coords=c("lon", "lat"), crs=4326)
+
+listings_ext_df <- read_csv(here::here("input", "listings.csv.gz")) %>%  # 96 cols
+    mutate_at(vars(contains("price")), funs(str_remove_all(., "\\$|,"))) %>% 
+    mutate_at(vars(contains("price")), funs(as.numeric))
+
+oslo_boroughs_sp <- geojsonio::geojson_read(here::here("input", "neighbourhoods.geojson"),
+                                            what="sp", stringsAsFactors=FALSE)
+```
+
+```{r shared_data}
+maybe <- function(item, head=NULL, brk=TRUE)
+  if(is.null(item) || is.na(item) || (is.numeric(item) && item==0)) '' else tagList((if(brk) br()), head, item)
+
+df <- listings_ext_df %>% 
+  select(id, name, medium_url, summary,
+         neighbourhood, longitude, latitude,
+         price, beds,
+         room_type, number_of_reviews, 
+         reviews_per_month) %>% 
+  filter(price>=500, price<=2000, beds<=10)
+
+#make_popups = function(df)
+##  lapply(1:nrow(df),
+#         function(i) {
+#           row = df[i,]
+#           HTML(as.character(p(
+#             strong(row$id), br(),
+#             row$name, br(),
+#             maybe(row$summary), br(),
+#             row$neighbourhood, br(),
+#             row$price, br(),
+#             row$medium_url
+#           )))
+#         })
+
+#df$popups = make_popups(df)
+
+color_fun  <- colorFactor(c('purple', 'red', 'blue'), unique(df$room_type))
+s_df <- crosstalk::SharedData$new(df)
+
+```
+
+Row {data-height=180}
+----------------
+  
+```{r}
+map = leaflet(width='100%') %>% addProviderTiles('Esri.WorldTopoMap') %>% 
+  setView(10.752245, 59.913868, zoom = 13) %>% 
+  addPolygons(data=oslo_boroughs_sp, fill=FALSE, color='steelblue', weight=3) %>% 
+  addCircleMarkers(data=s_df, color=~color_fun(room_type),
+                   radius=3, stroke=FALSE, opacity=0.3, fillOpacity=0.3)#,
+                   #label=df$name, popup=df$popups) #%>% 
+  #addLayersControl(overlayGroups=sort(unique(bza$`Status of Request`))) %>% 
+  #addLegend(position='bottomleft', pal=color_fun, values=bza$`Type of Request`)
+```
+
+### 
+
+```{r}
+crosstalk::filter_checkbox("rm_tp", "Room Type", s_df, ~room_type)
+```
+
+### 
+
+```{r}
+crosstalk::filter_slider("rm_pr", "Price", s_df, ~price, step=100, width="100%")
+```
+
+### 
+
+```{r}
+crosstalk::filter_select("nbh", "Neighbourhood", s_df, ~neighbourhood)
+```
+
+Row {data-height=1000}
+----------------
+  
+  
+```{r}
+map
+
+```
+
+
+
+
+How much does it cost?
+================
+```{r}
+plot_prices <- function(df){
+  df %>% 
+    ggplot(aes(x=beds, y=price))+
+    geom_jitter(aes(color=room_type))+
+    geom_smooth()+
+    scale_y_continuous(limits = c(100,1e4), trans="log10")+
+    scale_x_continuous(breaks = seq.int(0,10, by=2))+
+    scale_color_viridis_d()+
+    theme_minimal(base_family = "Roboto Condensed")+
+    theme(legend.position = "bottom")+
+    labs(subtitle=first(df$neighbourhood))
+}
+
+borough_data <- listings_ext_df %>%
+  filter(room_type!="Shared room",
+         price<=1e4, beds<=10) %>% 
+  group_by(neighbourhood_cleansed) %>% 
+  nest() %>% 
+  mutate(med_price=map_dbl(data, ~median(.x$price)),
+         listing_count=map_int(data, nrow),
+         price_bed_plot=map(data, plot_prices),
+         cent_lon=map_dbl(data, ~median(.$longitude)),
+         cent_lat=map_dbl(data, ~median(.$latitude)))
+
+oslo_boroughs_sf <- oslo_boroughs_sp %>% 
+    st_as_sf() %>% 
+    mutate(neighbourhood=case_when(
+    str_detect(neighbourhood, "^Gr.+kka$") ~ "Grünerløkka",
+    str_detect(neighbourhood, "ndre Nordstrand$") ~ "Søndre Nordstrand",
+    str_detect(neighbourhood, "stensj") ~ "Østensjø",
+    TRUE ~ neighbourhood
+  )) %>% left_join(borough_data, by=c("neighbourhood"="neighbourhood_cleansed")) %>% 
+  filter(listing_count>20)
+
+# Interactive
+mapview(oslo_boroughs_sf, zcol="listing_count", popup=popupGraph(oslo_boroughs_sf$price_bed_plot))+
+  mapview(places_sf, zcol="place", popup=popupImage(places_sf$url, src="remote"), legend=FALSE)
+```
+
+How long does it take?
+===================
+
+```{r,fig.width=6, fig.height=8, message=FALSE, warning=FALSE}
+  
+listings_ext_sf <- listings_ext_df %>% 
+  st_as_sf(coords=c("longitude", "latitude"), crs=4326)
+
+listing_grid_sf <- listings_ext_sf %>% 
+  st_make_grid(n=c(15,20), crs = 4326) %>%
+  st_sf() %>% mutate(grid_id=1:n())
+
+cells_to_keep <- sapply(st_intersects(listing_grid_sf, listings_ext_sf), function(x) length(x)>0)
+
+listing_grid_centroids_sf <- listing_grid_sf[cells_to_keep,] %>% 
+  st_transform(crs=32632) %>% 
+  st_centroid() %>% 
+  st_transform(crs=4326) %>% 
+  mutate(fold=paste0("fold_",1+seq(n())%/%25))
+
+get_gdist <- function(fold_id, mode, org, dst){
+
+  Sys.sleep(1)
+  fold_sf <- org %>% filter(fold==fold_id)
+  
+  stopifnot(nrow(fold_sf)<=25)
+  stopifnot(nrow(fold_sf)*nrow(dst)<=100)
+  
+  gdist_obj <- mapsapi::mp_matrix(origins = st_coordinates(fold_sf),
+                   destinations = st_coordinates(dst), 
+                   departure_time = as.POSIXct("2018-09-05 08:00:00"),
+                   mode = mode, 
+                   key = Sys.getenv("GOOGLE_MAPS_API_KEY")) 
+  
+  stopifnot(xml2::xml_text(xml2::xml_find_all(gdist_obj, xpath="./status"))=="OK")
+  
+  gdist_matrix <- gdist_obj %>% 
+    mp_get_matrix(value="duration_s")
+  
+  colnames(gdist_matrix) <- dst$place
+  gdist_matrix %>% 
+    as.tibble() %>% 
+    mutate(grid_id=fold_sf$grid_id,
+           mode=mode)
+}
+
+if(!file.exists(here::here("input", "grid_distances.rds"))){
+  grid_distances <- crossing(fold_id=unique(listing_grid_centroids_sf$fold), 
+                        mode=c("driving", "transit", "walking", "bicycling")) %>% 
+    pmap_dfr(get_gdist, org=listing_grid_centroids_sf, dst=places_sf)
+  
+  write_rds(grid_distances, here::here("input", "grid_distances.rds"))
+} 
+
+osl_grid_map <- get_stamenmap(bbox = as.numeric(st_bbox(oslo_boroughs_sf)), zoom = 12, maptype = "toner-lite")
+
+grid_distances <- read_rds(here::here("input", "grid_distances.rds"))
+
+grid_df <- listing_grid_sf[cells_to_keep,] %>% 
+  left_join(grid_distances, by = "grid_id") %>%
+  gather(key=key, value=value, -grid_id, -geometry, -mode) %>% 
+  mutate(value=value/60)
+
+#windowsFonts(`Roboto Condensed` = windowsFont("Roboto Condensed"))
+
+plot_grid_df <- function(df){
+
+ggmap::ggmap(osl_grid_map)+
+  geom_sf(data= df, aes(fill=value), inherit.aes = FALSE, color="transparent", alpha=0.8)+
+  scale_fill_viridis_c(option = "B", direction = -1)+
+  coord_sf(ndiscr = 2)+
+  facet_wrap(~key, nrow = 1) +
+  labs(x=NULL, y=NULL, subtitle=first(df$mode))+
+  theme(axis.text.x = element_blank())+
+  theme_bw()#base_family = "Roboto Condensed")
+
+}
+
+grid_df %>% 
+  split(.$mode) %>% 
+  map(plot_grid_df) %>% 
+  reduce(`+`)+
+  patchwork::plot_layout(ncol=1, guides = "collect")
+```
+
+Top picks
+===================
+
+### Chart 1
+
+```{r, fig.height=5, fig.width=6, message=FALSE, warning=FALSE}
+grid_time_df <- grid_df %>% 
+  st_set_geometry(NULL) %>% 
+  filter(mode=="transit") %>% 
+  group_by(grid_id) %>% 
+  summarise(mean_time=mean(value), 
+            median_time=median(value), 
+            min_time=min(value),
+            max_time=max(value))
+
+listings_grid_df <- listing_grid_sf[cells_to_keep,] %>% 
+  st_join(listings_ext_sf) %>% 
+  st_set_geometry(NULL) %>% 
+  filter(beds<=4) %>% 
+  group_by(grid_id) %>% 
+  summarise(borough=first(neighbourhood_cleansed),
+            median_price=median(price), 
+            mean_price=median(price), 
+            n_list=n()) %>% 
+  left_join(grid_time_df, by="grid_id")
+  
+  
+p <- listings_grid_df %>% 
+  ggplot(aes(x=median_time, y=median_price))+
+  geom_point(aes(color=borough, size=n_list), show.legend = FALSE) +
+  geom_smooth(method=lm)+
+  theme_ipsum_rc(grid_col = "grey90")+
+  scale_color_viridis_d(option="D", end=0.8) +
+  scale_y_continuous(limits = c(0,1250))+
+  labs(x="Median time to points of interest, min",
+       y="Median price per night, NOK",
+       color="Neighborhood",
+       size="Number of listings")
+
+#p
+ggplotly(p)
+```
+
+
+### Best locations
+
+```{r, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+
+selected_grids_sf <- listing_grid_sf[cells_to_keep,] %>% 
+  right_join(listings_grid_df, by="grid_id") %>% 
+  filter(median_time<20) %>% 
+  st_transform(crs=32632)
+
+selected_grids_buf_sf <- st_cast(st_buffer(selected_grids_sf, dist = -100)) %>% 
+  st_combine() %>% st_sf()
+
+selected_grids_diff_sf <- st_difference(selected_grids_sf, selected_grids_buf_sf) %>% 
+  st_cast() %>% st_transform(crs=4326)
+
+
+osl_map <- get_stamenmap(bbox = as.numeric(st_bbox(places_sf)), zoom = 13, maptype = "toner-lite")
+
+ggmap::ggmap(osl_map)+
+  geom_point(data=listings_ext_df, aes(x=longitude, y=latitude), color="darkslateblue", alpha=0.1)+
+  geom_sf(data=selected_grids_diff_sf, aes(fill=mean_time),color="transparent", inherit.aes = FALSE)+
+  geom_point(data=places_df, aes(x=lon, y=lat), inherit.aes = FALSE, color="violetred", size=5)+
+  geom_label_repel(data=places_df, aes(x=lon, y=lat, label=place), color="violetred", inherit.aes = FALSE, size=3)+
+  scale_fill_viridis_c(option = "B", direction=-1)+
+  theme_minimal()+
+  labs(x=NULL, y=NULL,
+       color="Travel time, min",
+       fill="Mean travel time")
+
+```
+
+
+Text in space
+================
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE}
+library(text2vec)
+library(cld2)
+library(stopwords)
+
+listings_en_df <- listings_ext_df %>% 
+  replace_na(list(summary="", description="")) %>% 
+  mutate(txt = paste(summary,description),
+         cjk=grepl("[\U4E00-\U9FFF\U3000-\U303F]", txt),
+         #cld2=cld2::detect_language(txt,plain_text = FALSE),
+         cld3=cld3::detect_language(txt)) %>% 
+  filter(!cjk, cld3=="en")
+
+
+tokens <- listings_en_df$txt %>% 
+  tolower %>% 
+  word_tokenizer()
+
+it <- itoken(tokens, ids=listings_en_df$id, progressbar=FALSE)
+
+v <- create_vocabulary(it, stopwords = stopwords::stopwords("en")) %>% 
+  prune_vocabulary(term_count_min = 10, doc_proportion_max = 0.2)
+
+vectorizer <- vocab_vectorizer(v)
+
+dtm <- create_dtm(it, vectorizer, type="dgTMatrix")
+
+n_topics <- 10
+set.seed(260)
+
+lda_model <- LDA$new(n_topics=n_topics, doc_topic_prior=0.1, topic_word_prior=0.01)
+
+
+doc_top_distr <- suppressWarnings( lda_model$fit_transform(x=dtm, n_iter=1000,
+                          convergence_tol = 0.0001, n_check_convergence = 50, 
+                          progressbar = FALSE) )
+
+varnames_df <- lda_model$get_top_words(n=5, topic_number=seq_len(n_topics), lambda=0.2) %>% 
+  apply(2,paste0, collapse=", ") %>% 
+  as_tibble() %>%
+  rename(top5words=value) %>% 
+  mutate(key=paste0("V", seq_len(n_topics)))
+
+#lda_model$plot()
+
+listings_en_df <-listings_en_df %>% 
+  select(id, longitude, latitude) %>% 
+  bind_cols(as_tibble(doc_top_distr)) %>% 
+  gather(key, value, -id, -longitude, -latitude) %>% 
+  left_join(varnames_df, by="key")
+
+```
+
+
+```{r}
+
+# reusing osl_grid_map
+plotLDA <- function(df){
+ggmap::ggmap(osl_grid_map)+
+  stat_summary_2d(data=df, aes(x=longitude,y=latitude, z=value), 
+                               fun = mean, alpha = 0.5, bins = 20, 
+                  inherit.aes = FALSE, show.legend = FALSE)+
+  #geom_tile(data=listings_en_df, aes(x=longitude,y=latitude, fill=V7), 
+  #                                      alpha = 0.5)+
+  scale_fill_gradient(name = "Value", low = "transparent", high = "red") +
+  theme_void(base_family = "Roboto Condensed")+
+    labs(subtitle=first(df$top5words))
+}
+
+listings_en_df %>% 
+  split(.$key) %>% 
+  map(plotLDA) %>% 
+  reduce(`+`) +
+  patchwork::plot_layout(ncol=2)
+```
+
+
+Spatial correlation
+================
+
+```{r}
+conn <- RPostgreSQL::dbConnect("PostgreSQL", host="localhost", dbname="ssb_geodata", user="postgres", password="postgres")
+
+pgPostGIS(conn)
+# lists geometry columns
+#pgListGeom(conn, geog = TRUE)
+# lists raster columns
+#pgListRast(conn)
+
+# alternative crs is EPSG 25833
+hsa_sf<- st_read(here::here("input", "ssb", "HandelServiceAnalyseRuter2017", "AnalyseRuter2017.shp"), crs=3045) %>% 
+  filter(KOMMUNENR=="0301")
+
+# employees and establishments
+emp_df <- data.table::fread(here::here("input", "ssb", "NOR250M_EST_2017", "NOR250M_EST_2017.csv"), 
+                            data.table = FALSE, sep=";", integer64 ="character")
+
+# population
+pop_df <- data.table::fread(here::here("input", "ssb", "Ruter250m_beflandet_2018", "Ruter250m_beflandet_2018.csv"), 
+                            data.table = FALSE, sep=";", integer64 ="character")
+
+# 0219 Bærum
+# 0301 Oslo
+q <- "SELECT * FROM rute250land WHERE kommunenr='0301'"
+oslo_ruter <- st_read_db(conn, query=q)
+
+RPostgreSQL::dbDisconnect(conn)
+```
+
+
+```{r}
+places_bbox_sf <- places_sf %>% 
+  st_transform(crs=3045) %>% 
+  st_bbox() %>% 
+  st_as_sfc()
+
+oslo_est_sf <- oslo_ruter %>% 
+  left_join(emp_df, by=c("ssbid"="SSBID250M")) %>% 
+  st_intersection(places_bbox_sf)
+
+oslo_pop_sf <- oslo_ruter %>% 
+  left_join(pop_df, by=c("ssbid"="ru250m")) %>% 
+  st_intersection(places_bbox_sf)
+
+oslo_hsa_sf <- hsa_sf %>% 
+  st_intersection(places_bbox_sf)
+
+oslo_est_r <- raster(oslo_est_sf, res=250)
+oslo_pop_r <- raster(oslo_pop_sf, res=250)
+oslo_hsa_r <- raster(oslo_hsa_sf, res=250)
+
+oslo_est_f <- fasterize(oslo_est_sf, oslo_est_r, field="est_tot", fun="sum")
+oslo_emp_f <- fasterize(oslo_est_sf, oslo_est_r, field="emp_tot", fun="sum")
+oslo_pop_f <- fasterize(oslo_pop_sf, oslo_pop_r, field="pop_tot", fun="sum")
+oslo_hsa_f <- fasterize(oslo_hsa_sf, oslo_hsa_r, field="hsareal", fun="sum")
+
+oslo_ee_s <- stack(oslo_est_f, oslo_emp_f, oslo_pop_f, oslo_hsa_f)
+names(oslo_ee_s) <- c("Companies", "Employees", "Populaton", "ShopServiceArea")
+
+#plot(oslo_ee_s[1,])
+```
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+tmp_osl_r <- raster(oslo_ee_s, 1)
+values(tmp_osl_r) <- 1:ncell(oslo_ee_s)
+
+charts_df <- tibble::tribble(~layer1, ~layer2, ~plotTitle,
+                             1, 3, "Residential Areas",
+                             3, 4, "Retail Locations",
+                             )
+
+osl_map <- get_stamenmap(bbox = as.numeric(st_bbox(places_sf)), zoom = 13, maptype = "toner-lite")
+
+plot_focal <- function(layer1, layer2, plotTitle, tmp_osl_r, oslo_ee_s, osl_map, places_df){
+
+  focal_cor_df <- focal(x=tmp_osl_r, w=matrix(1,5,5),
+                     fun=function(x, y=oslo_ee_s){
+                       cor(values(y)[x,layer1], values(y)[x,layer2],
+                           use="na.or.complete")
+                     }) %>%  
+    projectRaster(crs="+proj=longlat +datum=WGS84 +no_defs") %>% 
+    as("SpatialPixelsDataFrame") %>% 
+    as.data.frame() %>% 
+    setNames(c("value", "x", "y"))
+  
+  ggmap::ggmap(osl_map)+
+    geom_tile(data=focal_cor_df, aes(x,y, fill=value), alpha=0.4, inherit.aes = FALSE)+
+    geom_point(data=places_df, aes(x=lon, y=lat), inherit.aes = FALSE, color="violetred", size=5)+
+    geom_label_repel(data=places_df, aes(x=lon, y=lat, label=place), color="violetred", inherit.aes = FALSE, size=3)+
+    scale_fill_viridis_c(option="A", direction=1)+
+    theme_void(base_family = "Roboto Condensed")+
+    labs(subtitle=plotTitle, fill="Correlation")
+}
+
+charts_df %>% 
+  pmap(plot_focal, tmp_osl_r, oslo_ee_s, osl_map, places_df) %>% 
+  reduce(`+`) +
+  patchwork::plot_layout(ncol=2)
+```
+
+
+About
+================
+
+### About these maps
+
+This map shows AirBnB accomodations in Oslo as of July 31, 2018.
+
+Data is from the [InsideAirBnB](http://insideairbnb.com) and [Kartverket](https://kartkatalog.geonorge.no/search), mapped by Dmytro Perepolkin. 
+
+
+
+Copyright 2018 Dmytro Perepolkin
+
+  
+  `r Sys.Date()`
+
